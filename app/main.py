@@ -19,6 +19,7 @@ app = FastAPI(title="AI Subtitle Generator", version="1.0.0")
 MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MiB service-side ceiling
 MIN_CHUNK_DURATION_MS = 1_000  # 1 second lower bound when splitting audio
 CHUNK_EXPORT_BITRATE = "128k"
+NORMALIZED_SAMPLE_RATE = 16_000
 
 UPLOAD_PAGE_HTML = """
 <!DOCTYPE html>
@@ -543,7 +544,7 @@ def _ensure_mono_mp3(source_path: str) -> str:
         "-ac",
         "1",
         "-ar",
-        "16000",
+        str(NORMALIZED_SAMPLE_RATE),
         "-c:a",
         "libmp3lame",
         "-b:a",
@@ -581,5 +582,5 @@ def _trim_audio_to_duration(source_path: str, limit_ms: int) -> str:
 
     trimmed = audio[:limit_ms]
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
-        trimmed.export(temp.name, format="mp3", bitrate=CHUNK_EXPORT_BITRATE)
+    trimmed.export(temp.name, format="mp3", bitrate=CHUNK_EXPORT_BITRATE)
         return temp.name

@@ -4,7 +4,7 @@ FastAPI web service that transcribes uploaded audio or video into translated Eng
 
 ## Features
 - Accepts audio (`audio/*`) and video (`video/*`) uploads via `/generate-subtitles`
-- Normalises media locally to mono 16 kHz MP3 before transcription
+- Normalises media locally to mono 16 kHz MP3 (128 kbps) before transcription
 - Translates speech to English and returns timestamped SubRip (`.srt`) output
 - Automatically chunks large sources to stay within OpenAI's 25 MiB limit
 - Optional web UI at `/ui` with drag-and-drop support

@@ -259,7 +259,7 @@ UPLOAD_PAGE_HTML = """
                     const objectUrl = URL.createObjectURL(blob);
 
                     downloadLink.href = objectUrl;
-                    const baseName = selectedFile.name.replace(/\.[^.]+$/, '') || 'subtitles';
+                    const baseName = selectedFile.name.replace(/[.][^.]+$/, '') || 'subtitles';
                     downloadLink.download = `${baseName}.srt`;
                     downloadLink.style.display = 'inline-block';
                     setStatus('Completed. Click to download your subtitles.');
@@ -686,5 +686,5 @@ def _trim_audio_to_duration(source_path: str, limit_ms: int) -> str:
 
     trimmed = audio[:limit_ms]
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
-    trimmed.export(temp.name, format="mp3", bitrate=CHUNK_EXPORT_BITRATE)
+        trimmed.export(temp.name, format="mp3", bitrate=CHUNK_EXPORT_BITRATE)
         return temp.name

@@ -4,15 +4,17 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Iterable, Mapping
+from itertools import chain
+from typing import Iterable, Iterator, Mapping
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from openai import OpenAI
 from pydub import AudioSegment
+from starlette.background import BackgroundTask
 
 from .config import get_settings
-from .srt_utils import build_single_segment, segments_to_srt
+from .srt_utils import build_single_segment, iter_srt_blocks, segments_to_srt
 
 app = FastAPI(title="AI Subtitle Generator", version="1.0.0")
 
@@ -40,6 +42,7 @@ UPLOAD_PAGE_HTML = """
         button:disabled { background: #a5a5a5; cursor: not-allowed; }
         #status { margin-top: 16px; min-height: 24px; font-size: 0.95rem; }
         #download-link { display: none; margin-top: 16px; }
+        #live-output { display: none; background: #fff; border: 1px solid #dcdfe6; padding: 12px; margin-top: 16px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; font-family: "Courier New", monospace; font-size: 0.9rem; border-radius: 8px; }
         footer { margin-top: 48px; font-size: 0.85rem; color: #555; }
         a { color: #0984e3; }
     </style>
@@ -61,6 +64,7 @@ UPLOAD_PAGE_HTML = """
         </div>
     </div>
     <div id=\"status\"></div>
+    <pre id=\"live-output\"></pre>
     <a id=\"download-link\" href=\"#\" download=\"subtitles.srt\">Download subtitles</a>
 
     <footer>
@@ -75,6 +79,7 @@ UPLOAD_PAGE_HTML = """
         const statusEl = document.getElementById('status');
         const downloadLink = document.getElementById('download-link');
         const minutesInput = document.getElementById('minutes');
+        const liveOutput = document.getElementById('live-output');
 
         let selectedFile = null;
         let processingTimer = null;
@@ -115,6 +120,22 @@ UPLOAD_PAGE_HTML = """
             downloadLink.removeAttribute('href');
         }
 
+        function resetLiveOutput() {
+            liveOutput.textContent = '';
+            liveOutput.style.display = 'none';
+        }
+
+        function appendLiveText(text) {
+            if (!text) {
+                return;
+            }
+            if (liveOutput.style.display !== 'block') {
+                liveOutput.style.display = 'block';
+            }
+            liveOutput.textContent += text;
+            liveOutput.scrollTop = liveOutput.scrollHeight;
+        }
+
         function handleFiles(files) {
             if (!files || !files.length) {
                 return;
@@ -122,6 +143,7 @@ UPLOAD_PAGE_HTML = """
             selectedFile = files[0];
             setStatus(`Selected: ${selectedFile.name}`);
             resetDownload();
+            resetLiveOutput();
         }
 
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
@@ -156,13 +178,21 @@ UPLOAD_PAGE_HTML = """
             uploadBtn.disabled = true;
             stopBtn.disabled = false;
             resetDownload();
+            resetLiveOutput();
             const formData = new FormData();
             formData.append('file', selectedFile);
 
-            let url = '/generate-subtitles';
+            const params = new URLSearchParams();
+            params.set('stream', 'true');
             const minutes = minutesInput.value.trim();
             if (minutes) {
-                url += `?max_duration_minutes=${encodeURIComponent(minutes)}`;
+                params.set('max_duration_minutes', minutes);
+            }
+
+            let url = '/generate-subtitles';
+            const query = params.toString();
+            if (query) {
+                url += `?${query}`;
             }
 
             const xhr = new XMLHttpRequest();
@@ -172,6 +202,7 @@ UPLOAD_PAGE_HTML = """
             requestAborted = false;
 
             let uploadStarted = null;
+            let lastLength = 0;
 
             xhr.upload.onloadstart = () => {
                 uploadStarted = Date.now();
@@ -195,6 +226,15 @@ UPLOAD_PAGE_HTML = """
                 startProcessingStatus();
             };
 
+            xhr.onprogress = () => {
+                const response = xhr.responseText || '';
+                if (!response || response.length <= lastLength) {
+                    return;
+                }
+                appendLiveText(response.substring(lastLength));
+                lastLength = response.length;
+            };
+
             xhr.onreadystatechange = () => {
                 if (xhr.readyState !== XMLHttpRequest.DONE) {
                     return;
@@ -209,6 +249,11 @@ UPLOAD_PAGE_HTML = """
                 stopBtn.disabled = true;
 
                 if (xhr.status >= 200 && xhr.status < 300) {
+                    const response = xhr.responseText || '';
+                    if (response.length > lastLength) {
+                        appendLiveText(response.substring(lastLength));
+                        lastLength = response.length;
+                    }
                     const srtText = xhr.responseText || '';
                     const blob = new Blob([srtText], { type: 'text/plain;charset=utf-8' });
                     const objectUrl = URL.createObjectURL(blob);
@@ -282,6 +327,14 @@ UPLOAD_PAGE_HTML = """
 """
 
 
+def _cleanup_paths(paths: Iterable[str]) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _segment_iter(segments: Iterable[object] | None) -> list[Mapping[str, object]]:
     cleaned: list[Mapping[str, object]] = []
     if not segments:
@@ -311,7 +364,7 @@ async def upload_interface() -> str:
     return UPLOAD_PAGE_HTML
 
 
-@app.post("/generate-subtitles", response_class=PlainTextResponse)
+@app.post("/generate-subtitles")
 async def generate_subtitles(
     file: UploadFile = File(...),
     max_duration_minutes: int | None = Query(
@@ -320,7 +373,11 @@ async def generate_subtitles(
         le=240,
         description="Limit transcription to the first N minutes of audio",
     ),
-) -> PlainTextResponse:
+    stream: bool = Query(
+        default=False,
+        description="Stream subtitle output as it is generated",
+    ),
+):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Upload must include a filename")
 
@@ -342,11 +399,13 @@ async def generate_subtitles(
     settings = get_settings()
     client = OpenAI(api_key=settings.openai_api_key)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] or ".mp3") as temp:
+    with tempfile.NamedTemporaryFile(
+        delete=False, suffix=os.path.splitext(file.filename)[1] or ".mp3"
+    ) as temp:
         temp.write(data)
         temp_path = temp.name
 
-    cleanup_paths: set[str] = {temp_path}
+    cleanup_paths: list[str] = [temp_path]
 
     try:
         normalized_path = _ensure_mono_mp3(temp_path)
@@ -355,7 +414,7 @@ async def generate_subtitles(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Unable to normalize audio: {exc}") from exc
 
-    cleanup_paths.add(normalized_path)
+    cleanup_paths.append(normalized_path)
 
     trimmed_path = normalized_path
     if max_duration_minutes is not None:
@@ -363,20 +422,44 @@ async def generate_subtitles(
             trimmed_path = _trim_audio_to_duration(
                 normalized_path, max_duration_minutes * 60 * 1000
             )
-            cleanup_paths.add(trimmed_path)
+            cleanup_paths.append(trimmed_path)
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Unable to trim audio: {exc}") from exc
 
+    basename, _ = os.path.splitext(os.path.basename(file.filename))
+    safe_name = basename or "transcription"
+
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{safe_name}.srt\"",
+    }
+    segment_iter = _transcribe_with_chunking(
+        client, settings.openai_model, trimmed_path
+    )
+
+    if stream:
+        try:
+            first_segment = next(segment_iter)
+        except StopIteration as exc:
+            _cleanup_paths(cleanup_paths)
+            raise HTTPException(
+                status_code=502, detail="No transcription segments returned by OpenAI"
+            ) from exc
+
+        streaming_iter = iter_srt_blocks(chain([first_segment], segment_iter))
+        background = BackgroundTask(_cleanup_paths, cleanup_paths)
+        return StreamingResponse(
+            streaming_iter,
+            media_type="application/x-subrip",
+            headers=headers,
+            background=background,
+        )
+
     try:
-        segments = _transcribe_with_chunking(client, settings.openai_model, trimmed_path)
+        segments = list(segment_iter)
     finally:
-        for path in cleanup_paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+        _cleanup_paths(cleanup_paths)
 
     if not segments:
         raise HTTPException(status_code=502, detail="No transcription segments returned by OpenAI")
@@ -385,14 +468,11 @@ async def generate_subtitles(
     if not srt_payload:
         raise HTTPException(status_code=502, detail="Unable to create SRT output")
 
-    basename, _ = os.path.splitext(os.path.basename(file.filename))
-    safe_name = basename or "transcription"
-
-    headers = {
-        "Content-Disposition": f"attachment; filename=\"{safe_name}.srt\"",
-    }
-
-    return PlainTextResponse(content=srt_payload, media_type="application/x-subrip", headers=headers)
+    return PlainTextResponse(
+        content=srt_payload,
+        media_type="application/x-subrip",
+        headers=headers,
+    )
 
 
 @app.get("/healthz")
@@ -400,14 +480,35 @@ async def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
 
 
-def _transcribe_with_chunking(client: OpenAI, model: str, audio_path: str) -> list[dict[str, object]]:
+def _transcribe_with_chunking(
+    client: OpenAI, model: str, audio_path: str
+) -> Iterator[dict[str, object]]:
     file_size = os.path.getsize(audio_path)
+    emitted = False
+
+    def _emit_segments(
+        raw_segments: Iterable[Mapping[str, object]], *, offset_seconds: float
+    ) -> Iterator[dict[str, object]]:
+        nonlocal emitted
+        for seg in _segment_iter(raw_segments):
+            text = str(seg.get("text", "")).strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0) or 0.0) + offset_seconds
+            end = float(seg.get("end", start) or start) + offset_seconds
+            emitted = True
+            yield {"start": start, "end": end, "text": text}
 
     if file_size <= MAX_AUDIO_BYTES:
-        segments, _ = _translate_and_normalize(
+        segments, transcript_text = _translate_and_normalize(
             client, model, audio_path, offset_seconds=0.0
         )
-        return segments
+        yield from _emit_segments(segments, offset_seconds=0.0)
+        if not emitted:
+            yield from _emit_segments(
+                build_single_segment(transcript_text), offset_seconds=0.0
+            )
+        return
 
     try:
         audio = AudioSegment.from_file(audio_path)
@@ -421,7 +522,6 @@ def _transcribe_with_chunking(client: OpenAI, model: str, audio_path: str) -> li
     bytes_per_ms = max(file_size / duration_ms, 1e-6)
     max_chunk_ms = max(int(MAX_AUDIO_BYTES / bytes_per_ms), MIN_CHUNK_DURATION_MS)
 
-    segments: list[dict[str, object]] = []
     collected_text: list[str] = []
 
     start_ms = 0
@@ -477,17 +577,21 @@ def _transcribe_with_chunking(client: OpenAI, model: str, audio_path: str) -> li
             except OSError:
                 pass
 
-        segments.extend(chunk_segments)
+        yield from _emit_segments(
+            chunk_segments, offset_seconds=start_ms / 1000.0
+        )
         if chunk_text:
             collected_text.append(chunk_text)
 
         start_ms = min(duration_ms, end_ms_snapshot)
 
-    if not segments:
-        fallback_text = " ".join(text.strip() for text in collected_text if text and text.strip())
-        segments = build_single_segment(fallback_text)
-
-    return segments
+    if not emitted:
+        fallback_text = " ".join(
+            text.strip() for text in collected_text if text and text.strip()
+        )
+        yield from _emit_segments(
+            build_single_segment(fallback_text), offset_seconds=0.0
+        )
 
 
 def _translate_and_normalize(
